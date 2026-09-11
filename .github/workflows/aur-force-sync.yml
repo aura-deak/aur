@@ -1,0 +1,143 @@
+name: AUR Force Sync (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  force-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends jq curl python3
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Force update python-chinese-calendar (PyPI)
+        run: |
+          set -eux
+          PKGDIR="python-chinese-calendar"
+          VER=$(curl -s https://pypi.org/pypi/chinese-calendar/json | jq -r '.info.version')
+          echo "Upstream python-chinese-calendar: $VER"
+          JSON=$(curl -s "https://pypi.org/pypi/chinese-calendar/$VER/json")
+          URL=$(echo "$JSON" | jq -r '.urls[] | select(.packagetype=="sdist") | .url')
+          SHA=$(echo "$JSON" | jq -r '.urls[] | select(.packagetype=="sdist") | .digests.sha256')
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            curl -L -o /tmp/pcc.tar.gz "$URL"
+            SHA=$(sha256sum /tmp/pcc.tar.gz | awk '{print $1}')
+          fi
+          echo "sdist: $URL $SHA"
+          sed -i -E "s/^pkgver=.*/pkgver=$VER/" "$PKGDIR/PKGBUILD"
+          sed -i -E "s/^pkgrel=.*/pkgrel=1/" "$PKGDIR/PKGBUILD"
+          sed -i -E "s|^source=.*|source=(\"$URL\")|" "$PKGDIR/PKGBUILD"
+          sed -i -E "s/^sha256sums=.*/sha256sums=('$SHA')/" "$PKGDIR/PKGBUILD"
+          cat "$PKGDIR/PKGBUILD"
+          echo "VER=$VER" >> $GITHUB_ENV
+
+      - name: Force update Vantage packages (GitHub Releases)
+        run: |
+          set -eux
+          TAG=$(curl -s -H "Accept: application/vnd.github+json" https://api.github.com/repos/asystech-chen/Vantage/releases/latest | jq -r '.tag_name // empty')
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            TAG=$(curl -s https://api.github.com/repos/asystech-chen/Vantage/tags?per_page=1 | jq -r '.[0].name')
+          fi
+          FULL=${TAG#v}
+          PKGVER=${FULL%-*}
+          PKGREL=${FULL#*-}
+          if [ "$PKGVER" = "$FULL" ]; then PKGREL=1; fi
+          echo "Vantage tag=$TAG full=$FULL pkgver=$PKGVER pkgrel=$PKGREL"
+          echo "FULL=$FULL" >> $GITHUB_ENV
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "PKGVER=$PKGVER" >> $GITHUB_ENV
+          echo "PKGREL=$PKGREL" >> $GITHUB_ENV
+          curl -sL "https://github.com/asystech-chen/Vantage/releases/download/$TAG/SHA256SUMS" -o /tmp/vantage-SHA256SUMS || true
+          get_sha() { grep -E "$1" /tmp/vantage-SHA256SUMS 2>/dev/null | awk '{print $1}' | head -1; }
+          for pkg in vantage-browser vantage-browser-bin vantage-browser-appimage; do
+            sed -i -E "s/^pkgver=.*/pkgver=$PKGVER/" "$pkg/PKGBUILD"
+            sed -i -E "s/^pkgrel=.*/pkgrel=$PKGREL/" "$pkg/PKGBUILD"
+          done
+          DEB_X64_SHA=$(get_sha "vantage_${FULL}_amd64.deb")
+          DEB_ARM64_SHA=$(get_sha "vantage_${FULL}_arm64.deb")
+          if [ -z "$DEB_X64_SHA" ]; then curl -L -o /tmp/v.deb "https://github.com/asystech-chen/Vantage/releases/download/$TAG/vantage_${FULL}_amd64.deb"; DEB_X64_SHA=$(sha256sum /tmp/v.deb | awk '{print $1}'); fi
+          if [ -z "$DEB_ARM64_SHA" ]; then curl -L -o /tmp/va.deb "https://github.com/asystech-chen/Vantage/releases/download/$TAG/vantage_${FULL}_arm64.deb"; DEB_ARM64_SHA=$(sha256sum /tmp/va.deb | awk '{print $1}'); fi
+          sed -i -E "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$DEB_X64_SHA')/" vantage-browser-bin/PKGBUILD
+          sed -i -E "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('$DEB_ARM64_SHA')/" vantage-browser-bin/PKGBUILD
+          APP_X64_SHA=$(get_sha "vantage-${FULL}.x86_64.AppImage")
+          APP_ARM64_SHA=$(get_sha "vantage-${FULL}.aarch64.AppImage")
+          if [ -z "$APP_X64_SHA" ]; then curl -L -o /tmp/v.AppImage "https://github.com/asystech-chen/Vantage/releases/download/$TAG/vantage-${FULL}.x86_64.AppImage"; APP_X64_SHA=$(sha256sum /tmp/v.AppImage | awk '{print $1}'); fi
+          if [ -z "$APP_ARM64_SHA" ]; then curl -L -o /tmp/va.AppImage "https://github.com/asystech-chen/Vantage/releases/download/$TAG/vantage-${FULL}.aarch64.AppImage"; APP_ARM64_SHA=$(sha256sum /tmp/va.AppImage | awk '{print $1}'); fi
+          sed -i -E "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$APP_X64_SHA')/" vantage-browser-appimage/PKGBUILD
+          sed -i -E "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('$APP_ARM64_SHA')/" vantage-browser-appimage/PKGBUILD
+          for pkg in vantage-browser vantage-browser-bin vantage-browser-appimage; do echo "=== $pkg ==="; cat "$pkg/PKGBUILD"; done
+
+      - name: Generate .SRCINFO (force)
+        run: |
+          set -e
+          for pkg in python-chinese-calendar vantage-browser vantage-browser-bin vantage-browser-appimage; do
+            echo "--- $pkg ---"
+            if command -v docker >/dev/null 2>&1; then
+              docker run --rm -v "$PWD:/pkg" -w "/pkg/$pkg" archlinux:latest bash -c "
+                pacman -Sy --noconfirm --needed base-devel 2>&1 | tail -5
+                makepkg --printsrcinfo > .SRCINFO
+                cat .SRCINFO
+              "
+            else
+              (cd "$pkg" && makepkg --printsrcinfo > .SRCINFO && cat .SRCINFO)
+            fi
+          done
+
+      - name: Commit & Push (force)
+        run: |
+          set -e
+          git add python-chinese-calendar/PKGBUILD python-chinese-calendar/.SRCINFO vantage-browser/PKGBUILD vantage-browser/.SRCINFO vantage-browser-bin/PKGBUILD vantage-browser-bin/.SRCINFO vantage-browser-appimage/PKGBUILD vantage-browser-appimage/.SRCINFO 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "无变更可提交（已是最新）"
+            # 仍视为成功，触发生成产物
+            exit 0
+          fi
+          git commit -m "chore(aur): force sync $(date -u +%Y-%m-%d) python-chinese-calendar $VER vantage $FULL"
+          git push
+
+      - name: Push to AUR (force)
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -e
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/aur
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          push_one() {
+            local pkg=$1 ver=$2
+            echo "推送 $pkg ($ver) 到 AUR..."
+            TMPDIR=$(mktemp -d)
+            if ! git clone "ssh://aur@aur.archlinux.org/$pkg.git" "$TMPDIR/$pkg" 2>&1; then
+              mkdir -p "$TMPDIR/$pkg"
+              git -C "$TMPDIR/$pkg" init
+              git -C "$TMPDIR/$pkg" remote add origin "ssh://aur@aur.archlinux.org/$pkg.git"
+            fi
+            cp -v "$pkg/PKGBUILD" "$TMPDIR/$pkg/PKGBUILD"
+            cp -v "$pkg/.SRCINFO" "$TMPDIR/$pkg/.SRCINFO"
+            if [ -f "$pkg/.gitignore" ]; then cp -v "$pkg/.gitignore" "$TMPDIR/$pkg/.gitignore"; fi
+            git -C "$TMPDIR/$pkg" add PKGBUILD .SRCINFO .gitignore 2>/dev/null || git -C "$TMPDIR/$pkg" add PKGBUILD .SRCINFO
+            if git -C "$TMPDIR/$pkg" diff --cached --quiet; then echo "$pkg 无变更"; rm -rf "$TMPDIR"; return 0; fi
+            git -C "$TMPDIR/$pkg" commit -m "upgpkg: $pkg $ver (force sync)"
+            git -C "$TMPDIR/$pkg" push origin HEAD:master
+            rm -rf "$TMPDIR"
+          }
+          push_one "python-chinese-calendar" "$VER"
+          push_one "vantage-browser" "$FULL"
+          push_one "vantage-browser-bin" "$FULL"
+          push_one "vantage-browser-appimage" "$FULL"
