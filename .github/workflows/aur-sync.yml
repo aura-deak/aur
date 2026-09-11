@@ -23,6 +23,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
+      # ── python-chinese-calendar ──
       - name: Check python-chinese-calendar (PyPI)
         id: check-pcc
         run: |
@@ -56,7 +57,6 @@ jobs:
           echo "sdist URL: $URL"
           EXPECTED_SHA=$(echo "$JSON" | jq -r '.urls[] | select(.packagetype=="sdist") | .digests.sha256')
           if [ -z "$EXPECTED_SHA" ] || [ "$EXPECTED_SHA" = "null" ]; then
-            echo "通过下载计算 sha256..."
             curl -L -o /tmp/pcc.tar.gz "$URL"
             EXPECTED_SHA=$(sha256sum /tmp/pcc.tar.gz | awk '{print $1}')
           fi
@@ -65,48 +65,160 @@ jobs:
           sed -i -E "s/^pkgrel=.*/pkgrel=1/" "$PKGDIR/PKGBUILD"
           sed -i -E "s|^source=.*|source=(\"$URL\")|" "$PKGDIR/PKGBUILD"
           sed -i -E "s/^sha256sums=.*/sha256sums=('$EXPECTED_SHA')/" "$PKGDIR/PKGBUILD"
-          echo "=== updated PKGBUILD ==="
           cat "$PKGDIR/PKGBUILD"
 
-      - name: Generate .SRCINFO (via Arch Linux container)
-        if: steps.check-pcc.outputs.needs_update == 'true'
+      # ── Vantage (GitHub Releases) ──
+      # 参考上游打包逻辑：版本来自 version+release (tag v153.2.0-1)，产物校验以 SHA256SUMS 为准（见 Makefile:checksum）
+      - name: Check Vantage (GitHub Releases)
+        id: check-vantage
         run: |
           set -e
-          pkg="python-chinese-calendar"
-          echo "Generating .SRCINFO for $pkg ..."
-          if command -v docker >/dev/null 2>&1; then
-            docker run --rm -v "$PWD:/pkg" -w "/pkg/$pkg" archlinux:latest bash -c "
-              pacman -Sy --noconfirm --needed base-devel 2>&1 | tail -5
-              makepkg --printsrcinfo > .SRCINFO
-              cat .SRCINFO
-            "
-          else
-            echo "::warning::docker 不可用，兜底 sed 更新"
-            VER=$(grep -Po '^pkgver=\K.*' "$pkg/PKGBUILD")
-            SHA=$(grep -Po "^sha256sums=\('\K[^']+" "$pkg/PKGBUILD")
-            if [ -f "$pkg/.SRCINFO" ]; then
-              sed -i -E "s/^\s*pkgver = .*/\tpkgver = $VER/" "$pkg/.SRCINFO" || true
-              sed -i -E "s|^\s*source =.*|\tsource = $(grep '^source=' "$pkg/PKGBUILD" | sed 's/source=//')|" "$pkg/.SRCINFO" || true
-              sed -i -E "s/^\s*sha256sums = .*/\tsha256sums = $SHA/" "$pkg/.SRCINFO" || true
-            fi
+          # 获取最新 tag，如 v153.2.0-1
+          TAG=$(curl -s -H "Accept: application/vnd.github+json" https://api.github.com/repos/asystech-chen/Vantage/releases/latest | jq -r '.tag_name // empty')
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            TAG=$(curl -s https://api.github.com/repos/asystech-chen/Vantage/tags?per_page=1 | jq -r '.[0].name')
           fi
-          cat "$pkg/.SRCINFO"
+          FULL=${TAG#v}                 # 153.2.0-1
+          PKGVER=${FULL%-*}             # 153.2.0
+          PKGREL=${FULL#*-}             # 1
+          # 防御：若无 - 则 pkgrel 置 1
+          if [ "$PKGVER" = "$FULL" ]; then PKGREL=1; fi
+          echo "tag=$TAG full=$FULL pkgver=$PKGVER pkgrel=$PKGREL"
+          # 以 vantage-browser 为基准对比本地
+          CURRENT_VER=$(grep -Po '^pkgver=\K.*' vantage-browser/PKGBUILD | tr -d '"')
+          CURRENT_REL=$(grep -Po '^pkgrel=\K.*' vantage-browser/PKGBUILD | tr -d '"')
+          CURRENT_FULL="${CURRENT_VER}-${CURRENT_REL}"
+          echo "current vantage: $CURRENT_FULL"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "full=$FULL" >> $GITHUB_OUTPUT
+          echo "pkgver=$PKGVER" >> $GITHUB_OUTPUT
+          echo "pkgrel=$PKGREL" >> $GITHUB_OUTPUT
+          echo "current_full=$CURRENT_FULL" >> $GITHUB_OUTPUT
+          echo "current_ver=$CURRENT_VER" >> $GITHUB_OUTPUT
+          echo "current_rel=$CURRENT_REL" >> $GITHUB_OUTPUT
+          if [ "$FULL" != "$CURRENT_FULL" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          fi
+          # 预取 SHA256SUMS 供后续步骤使用（参考上游 release.yml 以 SHA256SUMS 为清单）
+          curl -sL "https://github.com/asystech-chen/Vantage/releases/download/$TAG/SHA256SUMS" -o /tmp/vantage-SHA256SUMS || true
+          echo "SHA256SUMS preview:"
+          head -20 /tmp/vantage-SHA256SUMS || echo "no SHA256SUMS"
+
+      - name: Update Vantage packages
+        if: steps.check-vantage.outputs.needs_update == 'true'
+        run: |
+          set -eux
+          PKGVER="${{ steps.check-vantage.outputs.pkgver }}"
+          PKGREL="${{ steps.check-vantage.outputs.pkgrel }}"
+          FULL="${{ steps.check-vantage.outputs.full }}"
+          TAG="${{ steps.check-vantage.outputs.tag }}"
+          echo "Updating Vantage to $FULL ($TAG)"
+
+          # 从 SHA256SUMS 提取各产物哈希（参考上游 Makefile 的 checksum 目标）
+          # 失败则回退为直接下载计算
+          get_sha() {
+            local pattern="$1"
+            local sha=$(grep -E "$pattern" /tmp/vantage-SHA256SUMS 2>/dev/null | awk '{print $1}' | head -1)
+            echo "$sha"
+          }
+
+          # vantage-browser: 编译包，仅更新版本，source 为 git tag，sha SKIP
+          for pkg in vantage-browser vantage-browser-bin vantage-browser-appimage; do
+            sed -i -E "s/^pkgver=.*/pkgver=$PKGVER/" "$pkg/PKGBUILD"
+            sed -i -E "s/^pkgrel=.*/pkgrel=$PKGREL/" "$pkg/PKGBUILD"
+          done
+
+          # vantage-browser-bin: deb 解包
+          DEB_X64_SHA=$(get_sha "vantage_${FULL}_amd64.deb")
+          DEB_ARM64_SHA=$(get_sha "vantage_${FULL}_arm64.deb")
+          # 回退：若 SHA256SUMS 未包含或为空，尝试直接通过下载获取（极少见）
+          if [ -z "$DEB_X64_SHA" ]; then
+            echo "warn: deb x64 sha not in SHA256SUMS, fallback download"
+            curl -L -o /tmp/vantage.deb "https://github.com/asystech-chen/Vantage/releases/download/$TAG/vantage_${FULL}_amd64.deb"
+            DEB_X64_SHA=$(sha256sum /tmp/vantage.deb | awk '{print $1}')
+          fi
+          if [ -z "$DEB_ARM64_SHA" ]; then
+            curl -L -o /tmp/vantage-arm64.deb "https://github.com/asystech-chen/Vantage/releases/download/$TAG/vantage_${FULL}_arm64.deb"
+            DEB_ARM64_SHA=$(sha256sum /tmp/vantage-arm64.deb | awk '{print $1}')
+          fi
+          echo "deb x64: $DEB_X64_SHA"
+          echo "deb arm64: $DEB_ARM64_SHA"
+          sed -i -E "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$DEB_X64_SHA')/" vantage-browser-bin/PKGBUILD
+          sed -i -E "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('$DEB_ARM64_SHA')/" vantage-browser-bin/PKGBUILD
+
+          # vantage-browser-appimage
+          APP_X64_SHA=$(get_sha "vantage-${FULL}.x86_64.AppImage")
+          APP_ARM64_SHA=$(get_sha "vantage-${FULL}.aarch64.AppImage")
+          if [ -z "$APP_X64_SHA" ]; then
+            curl -L -o /tmp/vantage.AppImage "https://github.com/asystech-chen/Vantage/releases/download/$TAG/vantage-${FULL}.x86_64.AppImage"
+            APP_X64_SHA=$(sha256sum /tmp/vantage.AppImage | awk '{print $1}')
+          fi
+          if [ -z "$APP_ARM64_SHA" ]; then
+            curl -L -o /tmp/vantage-aarch64.AppImage "https://github.com/asystech-chen/Vantage/releases/download/$TAG/vantage-${FULL}.aarch64.AppImage"
+            APP_ARM64_SHA=$(sha256sum /tmp/vantage-aarch64.AppImage | awk '{print $1}')
+          fi
+          echo "appimage x64: $APP_X64_SHA"
+          echo "appimage aarch64: $APP_ARM64_SHA"
+          sed -i -E "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$APP_X64_SHA')/" vantage-browser-appimage/PKGBUILD
+          sed -i -E "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('$APP_ARM64_SHA')/" vantage-browser-appimage/PKGBUILD
+
+          echo "=== vantage-browser PKGBUILD ==="
+          cat vantage-browser/PKGBUILD
+          echo "=== bin ==="
+          cat vantage-browser-bin/PKGBUILD
+          echo "=== appimage ==="
+          cat vantage-browser-appimage/PKGBUILD
+
+      - name: Generate .SRCINFO (via Arch Linux container)
+        if: steps.check-pcc.outputs.needs_update == 'true' || steps.check-vantage.outputs.needs_update == 'true'
+        run: |
+          set -e
+          # 收集需更新的包
+          PKGS=()
+          if [ "${{ steps.check-pcc.outputs.needs_update }}" = "true" ]; then PKGS+=("python-chinese-calendar"); fi
+          if [ "${{ steps.check-vantage.outputs.needs_update }}" = "true" ]; then PKGS+=("vantage-browser" "vantage-browser-bin" "vantage-browser-appimage"); fi
+          echo "Generating .SRCINFO for: ${PKGS[*]}"
+          for pkg in "${PKGS[@]}"; do
+            echo "--- $pkg ---"
+            if command -v docker >/dev/null 2>&1; then
+              docker run --rm -v "$PWD:/pkg" -w "/pkg/$pkg" archlinux:latest bash -c "
+                pacman -Sy --noconfirm --needed base-devel 2>&1 | tail -5
+                makepkg --printsrcinfo > .SRCINFO
+                cat .SRCINFO
+              "
+            else
+              # 本地直接生成（当前 runner 为 Arch，可直接调用 makepkg）
+              (cd "$pkg" && makepkg --printsrcinfo > .SRCINFO && cat .SRCINFO)
+            fi
+          done
 
       - name: Commit & Push
-        if: steps.check-pcc.outputs.needs_update == 'true'
+        if: steps.check-pcc.outputs.needs_update == 'true' || steps.check-vantage.outputs.needs_update == 'true'
         run: |
           set -e
-          git add python-chinese-calendar/PKGBUILD python-chinese-calendar/.SRCINFO
+          git add python-chinese-calendar/PKGBUILD python-chinese-calendar/.SRCINFO 2>/dev/null || true
+          git add vantage-browser/PKGBUILD vantage-browser/.SRCINFO 2>/dev/null || true
+          git add vantage-browser-bin/PKGBUILD vantage-browser-bin/.SRCINFO 2>/dev/null || true
+          git add vantage-browser-appimage/PKGBUILD vantage-browser-appimage/.SRCINFO 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "无变更可提交"
             exit 0
           fi
-          MSG="chore(aur): auto bump python-chinese-calendar ${{ steps.check-pcc.outputs.current }} -> ${{ steps.check-pcc.outputs.upstream }}"
+          MSG="chore(aur): auto bump"
+          if [ "${{ steps.check-pcc.outputs.needs_update }}" = "true" ]; then
+            MSG="$MSG python-chinese-calendar ${{ steps.check-pcc.outputs.current }} -> ${{ steps.check-pcc.outputs.upstream }}"
+          fi
+          if [ "${{ steps.check-vantage.outputs.needs_update }}" = "true" ]; then
+            if [ "${{ steps.check-pcc.outputs.needs_update }}" = "true" ]; then MSG="$MSG,"; fi
+            MSG="$MSG vantage ${{ steps.check-vantage.outputs.current_full }} -> ${{ steps.check-vantage.outputs.full }}"
+          fi
           git commit -m "$MSG"
           git push
 
       - name: Push to AUR
-        if: steps.check-pcc.outputs.needs_update == 'true'
+        if: steps.check-pcc.outputs.needs_update == 'true' || steps.check-vantage.outputs.needs_update == 'true'
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
@@ -119,25 +231,37 @@ jobs:
           ssh-add ~/.ssh/aur
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          pkg="python-chinese-calendar"
-          VER="${{ steps.check-pcc.outputs.upstream }}"
-          echo "推送 $pkg ($VER) 到 AUR..."
-          TMPDIR=$(mktemp -d)
-          if ! git clone "ssh://aur@aur.archlinux.org/$pkg.git" "$TMPDIR/$pkg" 2>&1; then
-            echo "::warning::clone $pkg 失败，尝试初始化"
-            mkdir -p "$TMPDIR/$pkg"
-            git -C "$TMPDIR/$pkg" init
-            git -C "$TMPDIR/$pkg" remote add origin "ssh://aur@aur.archlinux.org/$pkg.git"
-          fi
-          cp -v "$pkg/PKGBUILD" "$TMPDIR/$pkg/PKGBUILD"
-          cp -v "$pkg/.SRCINFO" "$TMPDIR/$pkg/.SRCINFO"
-          if [ -f "$pkg/.gitignore" ]; then cp -v "$pkg/.gitignore" "$TMPDIR/$pkg/.gitignore"; fi
-          git -C "$TMPDIR/$pkg" add PKGBUILD .SRCINFO .gitignore 2>/dev/null || git -C "$TMPDIR/$pkg" add PKGBUILD .SRCINFO
-          if git -C "$TMPDIR/$pkg" diff --cached --quiet; then
-            echo "$pkg 无变更可推送"
+
+          push_one() {
+            local pkg=$1
+            local ver=$2
+            echo "推送 $pkg ($ver) 到 AUR..."
+            TMPDIR=$(mktemp -d)
+            if ! git clone "ssh://aur@aur.archlinux.org/$pkg.git" "$TMPDIR/$pkg" 2>&1; then
+              mkdir -p "$TMPDIR/$pkg"
+              git -C "$TMPDIR/$pkg" init
+              git -C "$TMPDIR/$pkg" remote add origin "ssh://aur@aur.archlinux.org/$pkg.git"
+            fi
+            cp -v "$pkg/PKGBUILD" "$TMPDIR/$pkg/PKGBUILD"
+            cp -v "$pkg/.SRCINFO" "$TMPDIR/$pkg/.SRCINFO"
+            if [ -f "$pkg/.gitignore" ]; then cp -v "$pkg/.gitignore" "$TMPDIR/$pkg/.gitignore"; fi
+            git -C "$TMPDIR/$pkg" add PKGBUILD .SRCINFO .gitignore 2>/dev/null || git -C "$TMPDIR/$pkg" add PKGBUILD .SRCINFO
+            if git -C "$TMPDIR/$pkg" diff --cached --quiet; then
+              echo "$pkg 无变更可推送"
+              rm -rf "$TMPDIR"
+              return 0
+            fi
+            git -C "$TMPDIR/$pkg" commit -m "upgpkg: $pkg $ver"
+            git -C "$TMPDIR/$pkg" push origin HEAD:master
             rm -rf "$TMPDIR"
-            exit 0
+          }
+
+          if [ "${{ steps.check-pcc.outputs.needs_update }}" = "true" ]; then
+            push_one "python-chinese-calendar" "${{ steps.check-pcc.outputs.upstream }}"
           fi
-          git -C "$TMPDIR/$pkg" commit -m "upgpkg: $pkg $VER"
-          git -C "$TMPDIR/$pkg" push origin HEAD:master
-          rm -rf "$TMPDIR"
+          if [ "${{ steps.check-vantage.outputs.needs_update }}" = "true" ]; then
+            FULL="${{ steps.check-vantage.outputs.full }}"
+            push_one "vantage-browser" "$FULL"
+            push_one "vantage-browser-bin" "$FULL"
+            push_one "vantage-browser-appimage" "$FULL"
+          fi
