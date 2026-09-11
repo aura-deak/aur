@@ -11,7 +11,6 @@ AUR 专属维护仓库
 | `vantage-browser-bin` | 同上 | 同上 + `SHA256SUMS` | deb 解包安装：`vantage_${ver}_${arch}.deb` → `bsdtar -xf data.tar.xz` |
 | `vantage-browser-appimage` | 同上 | 同上 + `SHA256SUMS` | AppImage：`vantage-${ver}.x86_64.AppImage` / `aarch64.AppImage` |
 
-> `curfew` 仍由 [aura-deak/Curfew](https://github.com/aura-deak/Curfew) 主仓库维护，不在本仓库。
 
 ## 自动化
 
@@ -34,26 +33,3 @@ AUR 专属维护仓库
 ### 手动触发
 
 GitHub 页面：Actions → **AUR Daily Sync** → Run workflow
-
-或本地模拟：
-
-```bash
-curl -s https://pypi.org/pypi/chinese-calendar/json | jq .info.version
-curl -s https://api.github.com/repos/asystech-chen/Vantage/releases/latest | jq -r .tag_name
-curl -sL https://github.com/asystech-chen/Vantage/releases/download/v153.2.0-1/SHA256SUMS | head
-```
-
-## AUR 推送
-
-已启用 `Push to AUR`，需仓库 **Settings > Secrets** 配置 `AUR_SSH_PRIVATE_KEY`（本机 `~/.ssh/id_ed25519` 已写入）。
-
-## 本地维护结构
-
-```
-aur/
-  python-chinese-calendar/PKGBUILD / .SRCINFO
-  vantage-browser/PKGBUILD / .SRCINFO               # 编译
-  vantage-browser-bin/PKGBUILD / .SRCINFO           # deb
-  vantage-browser-appimage/PKGBUILD / .SRCINFO      # AppImage
-  .github/workflows/aur-sync.yml
-```
