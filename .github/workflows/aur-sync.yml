@@ -185,21 +185,53 @@ jobs:
           git commit -m "$MSG"
           git push
 
-      # 可选：自动推送到 AUR (aur.archlinux.org)
-      # 需在仓库 Settings > Secrets 添加 AUR_SSH_PRIVATE_KEY、AUR_USERNAME
-      # 取消下方注释即可启用
-      # - name: Push to AUR
-      #   if: steps.check-pcc.outputs.needs_update == 'true' || steps.check-curfew.outputs.needs_update == 'true'
-      #   env:
-      #     AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-      #     AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
-      #   run: |
-      #     set -e
-      #     mkdir -p ~/.ssh
-      #     echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
-      #     chmod 600 ~/.ssh/aur
-      #     ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
-      #     for pkg in python-chinese-calendar curfew; do
-      #       # 仅当该包本次有更新时推送
-      #       git push ssh://aur@aur.archlinux.org/$pkg.git HEAD:master  # 或 main，视 AUR 仓库分支
-      #     done
+      - name: Push to AUR
+        if: steps.check-pcc.outputs.needs_update == 'true' || steps.check-curfew.outputs.needs_update == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -e
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/aur
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          for pkg in python-chinese-calendar curfew; do
+            need="false"
+            if [ "$pkg" = "python-chinese-calendar" ]; then
+              need="${{ steps.check-pcc.outputs.needs_update }}"
+              VER="${{ steps.check-pcc.outputs.upstream }}"
+            else
+              need="${{ steps.check-curfew.outputs.needs_update }}"
+              VER="${{ steps.check-curfew.outputs.upstream }}"
+            fi
+            if [ "$need" != "true" ]; then
+              echo "跳过 $pkg (无更新)"
+              continue
+            fi
+            echo "推送 $pkg ($VER) 到 AUR..."
+            TMPDIR=$(mktemp -d)
+            # AUR 仓库分支为 master
+            if ! git clone "ssh://aur@aur.archlinux.org/$pkg.git" "$TMPDIR/$pkg" 2>&1; then
+              echo "::warning::clone $pkg 失败，尝试初始化"
+              mkdir -p "$TMPDIR/$pkg"
+              git -C "$TMPDIR/$pkg" init
+              git -C "$TMPDIR/$pkg" remote add origin "ssh://aur@aur.archlinux.org/$pkg.git"
+            fi
+            cp -v "$pkg/PKGBUILD" "$TMPDIR/$pkg/PKGBUILD"
+            cp -v "$pkg/.SRCINFO" "$TMPDIR/$pkg/.SRCINFO"
+            if [ -f "$pkg/.gitignore" ]; then cp -v "$pkg/.gitignore" "$TMPDIR/$pkg/.gitignore"; fi
+            git -C "$TMPDIR/$pkg" add PKGBUILD .SRCINFO .gitignore 2>/dev/null || git -C "$TMPDIR/$pkg" add PKGBUILD .SRCINFO
+            if git -C "$TMPDIR/$pkg" diff --cached --quiet; then
+              echo "$pkg 无变更可推送"
+              rm -rf "$TMPDIR"
+              continue
+            fi
+            git -C "$TMPDIR/$pkg" commit -m "upgpkg: $pkg $VER"
+            git -C "$TMPDIR/$pkg" push origin HEAD:master
+            rm -rf "$TMPDIR"
+          done
