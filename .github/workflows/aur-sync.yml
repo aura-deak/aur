@@ -38,7 +38,15 @@ jobs:
           if [ "$UPSTREAM" != "$CURRENT" ]; then
             echo "needs_update=true" >> $GITHUB_OUTPUT
           else
-            echo "needs_update=false" >> $GITHUB_OUTPUT
+            # 若 AUR 上尚无此包（首次上架），即使版本一致也需推送
+            AUR_INFO=$(curl -s "https://aur.archlinux.org/rpc/?v=5&type=info&arg[]=python-chinese-calendar")
+            if echo "$AUR_INFO" | jq -e '.resultcount==0' >/dev/null; then
+              echo "AUR 上不存在 python-chinese-calendar，需首次推送"
+              echo "needs_update=true" >> $GITHUB_OUTPUT
+              echo "needs_aur_init=true" >> $GITHUB_OUTPUT
+            else
+              echo "needs_update=false" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Update python-chinese-calendar
@@ -99,7 +107,20 @@ jobs:
           if [ "$FULL" != "$CURRENT_FULL" ]; then
             echo "needs_update=true" >> $GITHUB_OUTPUT
           else
-            echo "needs_update=false" >> $GITHUB_OUTPUT
+            # 若 AUR 上任一 vantage 包不存在，需首次推送（解决手动触发无版本变更时跳过的问题）
+            MISSING=false
+            for pkg in vantage-browser vantage-browser-bin vantage-browser-appimage; do
+              INFO=$(curl -s "https://aur.archlinux.org/rpc/?v=5&type=info&arg[]=$pkg")
+              if echo "$INFO" | jq -e '.resultcount==0' >/dev/null; then
+                echo "AUR 上不存在 $pkg，需首次推送"
+                MISSING=true
+              fi
+            done
+            if [ "$MISSING" = "true" ]; then
+              echo "needs_update=true" >> $GITHUB_OUTPUT
+            else
+              echo "needs_update=false" >> $GITHUB_OUTPUT
+            fi
           fi
           # 预取 SHA256SUMS 供后续步骤使用（参考上游 release.yml 以 SHA256SUMS 为清单）
           curl -sL "https://github.com/asystech-chen/Vantage/releases/download/$TAG/SHA256SUMS" -o /tmp/vantage-SHA256SUMS || true
