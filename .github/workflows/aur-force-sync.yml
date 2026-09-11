@@ -85,8 +85,10 @@ jobs:
             echo "--- $pkg ---"
             if command -v docker >/dev/null 2>&1; then
               docker run --rm -v "$PWD:/pkg" -w "/pkg/$pkg" archlinux:latest bash -c "
-                pacman -Sy --noconfirm --needed base-devel 2>&1 | tail -5
-                makepkg --printsrcinfo > .SRCINFO
+                pacman -Sy --noconfirm --needed base-devel sudo 2>&1 | tail -5
+                useradd -m builder
+                chown -R builder:builder /pkg
+                sudo -u builder makepkg --printsrcinfo > .SRCINFO
                 cat .SRCINFO
               "
             else
