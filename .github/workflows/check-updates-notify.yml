@@ -1,0 +1,39 @@
+name: Notify on failure
+
+on:
+  workflow_run:
+    workflows: ["AUR Daily Sync"]
+    types: [completed]
+
+permissions:
+  issues: write
+
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create issue on failure
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `AUR 自动更新失败: ${new Date().toISOString().slice(0,10)}`
+            const body = `Workflow \`${{ github.event.workflow_run.name }}\` 在 ${{ github.event.workflow_run.html_url }} 失败，请检查日志。`;
+            // 避免重复创建相同标题的 open issue
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 20
+            });
+            if (issues.data.some(i => i.title === title)) {
+              console.log('issue 已存在，跳过');
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['automation']
+            });
