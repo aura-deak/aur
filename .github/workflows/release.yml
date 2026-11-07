@@ -45,12 +45,14 @@ jobs:
 
           notes_file="$RUNNER_TEMP/release-notes.md"
           if [[ -n "$previous_tag" ]]; then
-            git log --no-merges --format='%s' "$previous_tag..$TAG" |
-              awk 'NF && !seen[$0]++ { print "- " $0 }' > "$notes_file"
+            git log --no-merges --format='%h %s%n%n%b' "$previous_tag..$TAG" > "$notes_file"
           else
-            git log --no-merges --format='%s' "$TAG" |
-              awk 'NF && !seen[$0]++ { print "- " $0 }' > "$notes_file"
+            git log --no-merges --format='%h %s%n%n%b' "$TAG" > "$notes_file"
           fi
+
+          # trim trailing blank lines, collapse runs of blank lines to one
+          sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$notes_file"
+          sed -i '/^$/N;/^\n$/D' "$notes_file"
 
           if [[ ! -s "$notes_file" ]]; then
             printf '%s\n' '- Maintenance release.' > "$notes_file"
